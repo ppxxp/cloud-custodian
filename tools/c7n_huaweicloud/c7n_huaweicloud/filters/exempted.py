@@ -5,6 +5,8 @@ from c7n import utils
 from c7n.filters import Filter
 from c7n.exceptions import PolicyValidationError
 from huaweicloudsdkcore.exceptions import exceptions
+from huaweicloudsdkiam.v3 import KeystoneListProjectsRequest
+from huaweicloudsdktms.v1 import ResqTagResource, ListResourceRequest
 from requests.exceptions import HTTPError
 
 log = logging.getLogger("custodian.huaweicloud.filters.exempted")
@@ -125,6 +127,8 @@ class ExemptedFilter(Filter):
         obs_url={'type': 'string'},
         group_key={'type': 'string'})
     schema_alias = True
+    need_get_tags_from_tms = False
+    tms_resource_tag_map = {}
 
     def validate(self):
         field = self.data.get('field', None)
@@ -147,6 +151,18 @@ class ExemptedFilter(Filter):
         if obs_url is not None:
             exempted_values.extend(self.get_exempted_values_from_obs(obs_url, group_key))
 
+        self.need_get_tags_from_tms = (
+                field == 'tags' and any('tags' not in resource for resource in resources))
+        if self.need_get_tags_from_tms:
+            if 'tag_resource_type' in resources[0].keys():
+                self.tms_resource_tag_map = (
+                    self.get_resource_tag_map_from_tms(resources[0]['tag_resource_type']))
+            else:
+                self.log.error("Need get resource tag map from tms, "
+                               "but not found tag_resource_type")
+                raise PolicyValidationError("Need get resource tag map from tms, "
+                                            "but not found tag_resource_type")
+
         results = []
         for resource in resources:
             if self.filter_single_resource(resource, field, exempted_values):
@@ -157,7 +173,15 @@ class ExemptedFilter(Filter):
         if len(exempted_values) == 0:
             return True
         try:
-            resource_values = get_values_from_resource(i, field)
+            if self.need_get_tags_from_tms and i["id"] in self.tms_resource_tag_map.keys():
+                tag_map_list = self.tms_resource_tag_map.get(i["id"])
+                resource_values = [tag_map.key for tag_map in tag_map_list]
+            elif self.need_get_tags_from_tms and i["id"] not in self.tms_resource_tag_map.keys():
+                self.log.warning(f"Need get resource tag map from tms, "
+                                 f"but {i['id']} not get from tms")
+                resource_values = get_values_from_resource(i, field)
+            else:
+                resource_values = get_values_from_resource(i, field)
         except TypeError:
             self.log.warning(f"{field} type error in resource {i['id']}, "
                              f"only support int or string, not filter the resource")
@@ -199,6 +223,59 @@ class ExemptedFilter(Filter):
         except Exception:
             self.log.error("get_exempted_values_from_obs occur error")
             raise
+
+    def get_resource_tag_map_from_tms(self, tag_resource_type):
+        try:
+            resource_tag_map = {}
+            project_id = self.get_project_id()
+            tms_client = utils.local_session(self.manager.session_factory).client("tms")
+            limit = 200
+            offset = 0
+            while True:
+                request_body = ResqTagResource(
+                    project_id=project_id,
+                    resource_types=[tag_resource_type],
+                    without_any_tag=False,
+                    tags=[],
+                    limit=limit,
+                    offset=offset
+                )
+                request = ListResourceRequest(body=request_body)
+                response = tms_client.list_resource(request=request)
+                if len(response.errors) == 0:
+                    resource_tag_list = response.resources
+                    total_count = response.total_count
+                    for resource_tag in resource_tag_list:
+                        resource_tag_map[resource_tag.resource_id] = resource_tag.tags
+                    if len(resource_tag_map) >= total_count:
+                        break
+                    else:
+                        offset = offset + limit
+                else:
+                    self.log.error(f"get tms resources failed: {response.errors}")
+                    raise HTTPError(200, response.errors)
+
+            return resource_tag_map
+        except exceptions.ClientRequestException as e:
+            self.log.error("get resource from tms failed, ", e.status_code, e.request_id,
+                           e.error_code, e.error_msg)
+            raise
+        except Exception:
+            self.log.error("get_resource_tag_map_from_tms occur error")
+            raise
+
+    def get_project_id(self):
+        iam_client = utils.local_session(self.manager.session_factory).client("iam-v3")
+
+        region = utils.local_session(self.manager.session_factory).region
+        request = KeystoneListProjectsRequest(name=region)
+        response = iam_client.keystone_list_projects(request=request)
+        for project in response.projects:
+            if region == project.name:
+                return project.id
+
+        self.log.error("Can not get project_id for %s", region)
+        raise PolicyExecutionError("Can not get project_id for %s", region)
 
 
 class RestrictedFilter(Filter):
